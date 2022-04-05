@@ -1,0 +1,227 @@
+---
+title: "XGBoost and Shapley Values for Olympics"
+author: "Olexiy Pukhov"
+date: "4/5/2022"
+output: word_document
+always_allow_html: yes
+---
+The following code makes all plots and images higher resolution.
+
+```{r}
+knitr::opts_chunk$set(dpi = 300) 
+```
+
+
+This is an exercise to help me get the skills for my research. I tried using XGBoost on the Olympics data.
+First, we need to install the many packages we need for this. We can use
+install.packages and then library, but using pacman needs less code to do this
+and is faster.
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(pacman, rio, tidyverse, xgboost, caTools, ggplot2, Ckmeans.1d.dp,
+               DALEXtra, mlr, caret, DiagrammeR, SHAPforxgboost, rmarkdown,
+               skimr)
+```
+## Importing Data
+Now, let's import the data and then remove the values that are highly correlated
+with other values. Then, let's look at the structure of the data.
+Then, let's look at the top 20 rows. There are too many rows,
+so they spill over to the next page. The ## represents the row #
+
+```{r}
+data <- import("olympicmedals.dta")
+data = data %>% 
+  select(-c(cc, year, lpop, lrgdpepc, sptinc992j_p90p100, sptinc992j_p99p100))
+skimr::skim(data)
+head(data,n = 20)
+```
+
+Let's set the same seed for random number generation for reproducibility.
+Then, let's split the data into a training and testing set. The model will be 
+tested on the training set, and then tested on the testing set for accuracy.
+75% of the data is going into the training set, and 25% of the data is going
+into the testing set.
+
+```{r}
+set.seed(1)
+split = sample.split(data$points, SplitRatio = 0.75)
+training_set = subset(data, split == TRUE)
+testing_set = subset(data, split == FALSE)
+```
+
+The XGBoost algorithm requires that the input values are in a matrix. The
+algorithm only accepts numerical data. This also means that if there is 
+categorical variables, we have to change them to dummy variables where
+each column is either a 0 or 1 depending on the category and there are
+n - 1 columns to represent the categorical data. In this dataset, there
+are no categorical values.
+
+Let's change the training and testing sets into a matrix.
+
+```{r}
+training_set = training_set %>% 
+  as.matrix()
+
+testing_set = testing_set %>% 
+  as.matrix()
+```
+
+## Model Generation
+
+Let's make the XGBoost model, predict some new values and calculate the error
+in terms of MSE, MAE and RMSE on the testing set.
+
+```{r}
+model = xgboost(data = training_set[,-8], label = training_set[,8], nrounds = 40)
+pred_y = predict(model,testing_set[,-8])
+
+
+mse = mean((testing_set[8] - pred_y)^2)
+mae = caret::MAE(testing_set[8], pred_y)
+rmse = caret::RMSE(testing_set[8], pred_y)
+
+cat("MSE: ", mse, "MAE: ", mae, " RMSE: ", rmse)
+
+
+```
+
+Let's compare this to the initial linear model that I made before.
+
+```{r}
+data2 <- import("olympicmedals.dta")
+data2 <- data2 %>% 
+  filter(!is.na(data2$lpop))
+
+data2 <- data2 %>% 
+  filter(!is.na(data2$lrgdpepc))
+
+set.seed(1)
+split2 = sample.split(data2$points, SplitRatio = 0.75)
+training_set2 = subset(data2, split2 == TRUE)
+testing_set2 = subset(data2, split2 == FALSE)
+
+model2 <- lm(points ~ lpop + lrgdpepc, data=training_set2)
+pred_y2 = predict(model2,testing_set2[,-12])
+
+mse2 = mean((testing_set2[,12] - pred_y2)^2)
+mae2 = caret::MAE(testing_set2[,12], pred_y2)
+rmse2 = caret::RMSE(testing_set2[,12], pred_y2)
+
+cat("MSE: ", mse2, "MAE: ", mae2, " RMSE: ", rmse2)
+```
+
+The XGBoost model is much more accurate. It has an RMSE of 5.66, compared to the linear
+regression model which has a RMSE of 18.3685.
+
+## Visualizing the results
+
+Let's now visualize what features are important in this model. Out of all the 
+variables we supplied to the model, which were the most important?
+
+```{r}
+xgb_imp <- xgb.importance(feature_names = model$feature_names,
+                          model = model)
+xgb.ggplot.importance(xgb_imp, n_clusters = 1)
+```
+It looks like rgdpe (Expenditure-side real GDP at chained PPPs (in mil. 2017 US$) was 
+the most important variable in predicting the results. 
+
+This will plot the first decision tree, which is not really useful
+for interpretation as XGBoost is an ensemble decision tree model, composed of
+many trees. However, it is still useful to give us an idea of what the 
+algorithm is thinking about.
+
+```{r}
+xgb.plot.tree(model = model, trees = 0)
+``` 
+```{r figurename, echo=FALSE, out.width = '120%'}
+knitr::include_graphics("Tree.png")
+```
+
+Now let's calculate the SHAP values and see which variable features were most
+important for our model.
+
+```{r}
+shap <- shap.prep(xgb_model = model, X_train = testing_set[,-8])
+shap.plot.summary(shap)
+```
+Rgdpe is the most important valuable for predicting points won in the olympics.
+Let's look at this variable in a partial dependence plot.
+
+```{r}
+shap.plot.dependence(shap, "rgdpe", color_feature = "auto", 
+                     alpha = 0.5, jitter_width = 0.1)
+```
+It seems that a low rgdpe (Expenditure-side real GDP at chained PPPs (in mil. 2017 US$)
+hampers your ability to get points at a low value, has less an effect at higher values,
+and at very high values allows you to obtain higher points. Let us make sure of the results
+by looking again at our testing set.
+
+```{r}
+  max(testing_set[,8])
+```
+It seems the country with the maximum amount of points in the testing set was 10. If we compare this to our 
+training set:
+```{r}
+  max(training_set[,8])
+```
+The maximum amount of points of a country in the training set is 232. This is an result of the countries randomly being put
+in the training and testing set. How do the results differ if a country with higher points
+was randomly chosen to be in the testing set? Let's try a SplitRatio of 0.7.
+
+```{r}
+data <- import("olympicmedals.dta")
+
+data = data %>% 
+  select(-c(cc, year, lpop, lrgdpepc, sptinc992j_p90p100, sptinc992j_p99p100))
+
+set.seed(1)
+split = sample.split(data$points, SplitRatio = 0.7)
+training_set = subset(data, split == TRUE)
+testing_set = subset(data, split == FALSE)
+
+training_set = training_set %>% 
+  as.matrix()
+
+testing_set = testing_set %>% 
+  as.matrix()
+
+```
+
+Let's check the testing set to see if it has a higher country with max value for points.
+
+```{r}
+  max(testing_set[,8])
+```
+
+Let's also check the max value for points in the training set to see if it includes a high
+point scoring country.
+
+```{r}
+  max(training_set[,8])
+```
+
+Now let's calculate the model again.
+
+```{r}
+model = xgboost(data = training_set[,-8], label = training_set[,8], nrounds = 40)
+
+
+pred_y = predict(model,testing_set[,-8])
+
+
+mse = mean((testing_set[8] - pred_y)^2)
+mae = caret::MAE(testing_set[8], pred_y)
+rmse = caret::RMSE(testing_set[8], pred_y)
+
+cat("MSE: ", mse, "MAE: ", mae, " RMSE: ", rmse)
+
+```
+
+The RMSE of our model is now 19.36, larger than the RMSE for our linear model at
+18.37. At smaller values of points, the XGBoost model works better than the linear model.
+However, at larger values of points, the XGboost model becomes worse than the linear model.
+Only a few countries won a lot of points in the olympics (USA, Russia, Great Britain, Japan and China).
+This is probably because of insufficient data - XGBoost is designed for very large data,
+and does not work well with a few outliers in a very small dataset.
